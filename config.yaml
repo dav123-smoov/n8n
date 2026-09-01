@@ -1,6 +1,19 @@
 server:
   listen: "0.0.0.0:5000"
 
+frontend:
+  staticPath: "/app/frontend/dist"
+
+database:
+  driver: sqlite
+  sqlite:
+    path: "/app/data/backend.db"
+
+media:
+  driver: local
+  local:
+    path: "/app/data/media"
+
 secrets:
   jwtSecret: "david_supergrok_jwt_secret_key_2026_xyz123"
   credentialEncryptionKey: "ZGF2aWRfc3VwZXJncm9rX2tleV8yMDI2X2FwaV9zZWNyZXQ="
