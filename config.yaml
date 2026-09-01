@@ -1,5 +1,5 @@
 server:
-  listen: "0.0.0.0:8000"
+  listen: "0.0.0.0:5000"
   requestTimeout: 2h
   swaggerEnabled: true
 
