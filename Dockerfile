@@ -1,54 +1,16 @@
-ARG NODE_VERSION=22
-ARG GO_VERSION=1.24
-ARG ALPINE_VERSION=3.21
+FROM chenyme/grok2api:latest
 
-FROM node:22-alpine AS frontend-builder
+USER root
 
-WORKDIR /src/frontend
-RUN corepack enable
-
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install
-
-COPY frontend ./
-RUN pnpm build
-
-
-FROM golang:1.24-alpine AS backend-builder
-
-WORKDIR /src/backend
-RUN apk add --no-cache ca-certificates git
-
-COPY backend/go.mod backend/go.sum ./
-RUN go mod download
-
-COPY backend ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/grok2api ./cmd/grok2api
-
-
-FROM alpine:3.21
-
-ENV TZ=UTC \
-    GROK2API_CONFIG_SOURCE=/run/grok2api/config.yaml
-
-RUN apk add --no-cache ca-certificates su-exec tzdata && \
-    addgroup -S -g 10001 grok2api && \
-    adduser -S -D -H -u 10001 -G grok2api grok2api && \
-    mkdir -p /app/data /run/grok2api /var/lib/grok2api-quality-guard && \
-    chown -R grok2api:grok2api /app/data /run/grok2api /var/lib/grok2api-quality-guard && \
-    chmod 0700 /var/lib/grok2api-quality-guard
-
-WORKDIR /app
-
-COPY --from=backend-builder /out/grok2api /app/grok2api
-COPY --from=frontend-builder /src/frontend/dist /app/frontend/dist
-COPY config.yaml /run/grok2api/config.yaml
 COPY config.yaml /app/config.yaml
-COPY VERSION /app/VERSION
-COPY docker/entrypoint.sh /usr/local/bin/grok2api-entrypoint
-RUN chmod 0755 /usr/local/bin/grok2api-entrypoint
+COPY config.yaml /run/grok2api/config.yaml
 
-EXPOSE 8000
+RUN mkdir -p /app/data /run/grok2api /var/lib/grok2api-quality-guard && \
+    chown -R grok2api:grok2api /app/config.yaml /run/grok2api /app/data /var/lib/grok2api-quality-guard 2>/dev/null || true
 
-ENTRYPOINT ["/usr/local/bin/grok2api-entrypoint"]
-CMD ["/app/grok2api", "--config", "/app/config.yaml", "--listen", "0.0.0.0:8000"]
+RUN printf '#!/bin/sh\nPORT="${PORT:-8000}"\nexec su-exec grok2api:grok2api /app/grok2api --config /app/config.yaml --listen "0.0.0.0:${PORT}"\n' > /app/start.sh && \
+    chmod +x /app/start.sh
+
+EXPOSE 8000 5000 10000
+
+ENTRYPOINT ["/app/start.sh"]
