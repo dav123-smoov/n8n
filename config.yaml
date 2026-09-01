@@ -15,8 +15,8 @@ media:
     path: "/app/data/media"
 
 secrets:
-  jwtSecret: "david_supergrok_jwt_secret_key_2026_xyz123"
-  credentialEncryptionKey: "ZGF2aWRfc3VwZXJncm9rX2tleV8yMDI2X2FwaV9zZWNyZXQ="
+  jwtSecret: "6a2f29d3471b66a1371d586a784863eeaaf9baac0bb4c3c13cccbd488a5252b5"
+  credentialEncryptionKey: "y0h9CfEqHOnPHeEFrprGn4MiBhbykrye9oPHM7pRh1I="
 
 bootstrapAdmin:
   username: "admin"
