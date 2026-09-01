@@ -64,6 +64,8 @@ WORKDIR /app
 COPY --from=backend-builder --chmod=0755 /out/grok2api /app/grok2api
 COPY --from=frontend-builder /src/frontend/dist /app/frontend/dist
 COPY VERSION /app/VERSION
+COPY config.yaml /run/grok2api/config.yaml
+COPY config.yaml /app/config.yaml
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/grok2api-entrypoint
 
 EXPOSE 8000
@@ -73,3 +75,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 ENTRYPOINT ["/usr/local/bin/grok2api-entrypoint"]
 CMD ["/app/grok2api", "--config", "/app/config.yaml", "--listen", "0.0.0.0:8000"]
+
