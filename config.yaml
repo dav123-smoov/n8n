@@ -1,5 +1,8 @@
 server:
   listen: "0.0.0.0:5000"
+  maxBodyBytes: 33554432
+  trustedProxies: []
+  readTimeout: 15m
   requestTimeout: 2h
   swaggerEnabled: true
 
@@ -43,6 +46,10 @@ routing:
   reasoningReplayMaxEntries: 10240
   accountIsolatedConnections: false
   segmentedSelectorEnabled: true
+  segmentedSelectorMinCandidates: 3000
+  segmentedSelectorWindowSize: 64
+  autoAssignMaxNodeShare: 0
+  autoAssignMaxMigrationShare: 0
 
 audit:
   bufferSize: 16384
