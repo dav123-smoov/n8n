@@ -1,4 +1,4 @@
-FROM chenyme/grok2api:latest
+FROM ghcr.io/chenyme/grok2api:latest
 
 COPY config.yaml /run/grok2api/config.yaml
 COPY config.yaml /app/config.yaml
