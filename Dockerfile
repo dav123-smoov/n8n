@@ -1,4 +1,4 @@
-FROM chenyme/grok2api:latest
+FROM ghcr.io/chenyme/grok2api:latest
 
 USER root
 
