@@ -9,7 +9,6 @@ const UPSTREAM_PORT = 5001;
 const LISTEN_PORT = process.env.PORT || 5000;
 const MEDIA_DIR = process.env.MEDIA_DIR || '/app/data/media';
 
-// Start grok2api upstream process
 console.log('[Proxy] Starting grok2api upstream on port ' + UPSTREAM_PORT + '...');
 const grokProcess = spawn('/app/grok2api', ['--config', '/app/config.yaml', '--listen', `0.0.0.0:${UPSTREAM_PORT}`], {
   stdio: 'inherit'
@@ -26,11 +25,9 @@ setTimeout(async () => {
     const sso = process.env.SSO_TOKEN;
     if (!sso) return;
 
-    // Check health
     const hRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/healthz`).catch(() => null);
     if (!hRes || !hRes.ok) return;
 
-    // Login as admin
     const loginRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -40,7 +37,6 @@ setTimeout(async () => {
     const token = loginData.data?.tokens?.accessToken;
     if (!token) return;
 
-    // Check accounts
     const accRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/accounts`, {
       headers: { 'Authorization': 'Bearer ' + token }
     });
@@ -56,32 +52,19 @@ setTimeout(async () => {
       });
       console.log('[Bootstrap] SSO account imported.');
     }
-
-    // Check client keys
-    const kRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/client-keys`, {
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
-    const kData = await kRes.json();
-    if (kData.data?.total === 0) {
-      console.log('[Bootstrap] Auto-creating client key...');
-      const newKey = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/client-keys`, {
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'n8n-youtube-autoposter' })
-      });
-      const newKeyData = await newKey.json();
-      console.log('[Bootstrap] Created client key:', newKeyData.data?.secret);
-    }
   } catch (err) {
     console.error('[Bootstrap] Error:', err.message);
   }
 }, 5000);
 
-// Helper to download a video URL to local tmp file
+// Helper to download a video URL
 async function downloadToFile(fileUrl, destPath) {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(fileUrl);
-    // If it's localhost or direct asset, resolve local path if possible
+    // If it points to supergrok-api, fetch via localhost loopback
+    let target = fileUrl.replace(/https?:\/\/supergrok-api\.onrender\.com/i, `http://127.0.0.1:${UPSTREAM_PORT}`);
+    const parsed = new URL(target);
+
+    // Direct local asset check
     if (parsed.pathname.startsWith('/v1/media/videos/')) {
       const assetName = path.basename(parsed.pathname);
       const localCandidate = path.join(MEDIA_DIR, 'videos', assetName);
@@ -91,13 +74,20 @@ async function downloadToFile(fileUrl, destPath) {
       }
     }
 
-    const getter = parsed.protocol === 'https:' ? https.get : http.get;
-    getter(fileUrl, res => {
+    const isHttps = parsed.protocol === 'https:';
+    const getter = isHttps ? https.get : http.get;
+    const reqOptions = {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    };
+
+    getter(target, reqOptions, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return downloadToFile(res.headers.location, destPath).then(resolve, reject);
       }
       if (res.statusCode !== 200) {
-        return reject(new Error(`Failed to download ${fileUrl}: ${res.statusCode}`));
+        return reject(new Error(`Failed to download ${fileUrl}: status ${res.statusCode}`));
       }
       const file = fs.createWriteStream(destPath);
       res.pipe(file);
@@ -137,34 +127,32 @@ const server = http.createServer((req, res) => {
           downloadedFiles.push(dest);
         }
 
-        // Create concat list file
+        // Concat list file
         const listFile = path.join(tmpDir, 'concat_list.txt');
         const listContent = downloadedFiles.map(f => `file '${f}'`).join('\n');
         fs.writeFileSync(listFile, listContent);
 
-        // Target output inside grok2api media directory so it is instantly servable!
+        // Output inside grok2api media directory so it's instantly public & servable
         const assetId = 'vid_stitched_' + runId;
         const outDir = path.join(MEDIA_DIR, 'videos');
         fs.mkdirSync(outDir, { recursive: true });
         const outFile = path.join(outDir, assetId);
 
         console.log(`[Stitcher] Running FFmpeg concat to ${outFile}...`);
-        // Use fast demuxer concat (stream copy, no quality loss, <1s)
         try {
           execSync(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy -movflags +faststart "${outFile}"`, { stdio: 'pipe' });
         } catch (copyErr) {
-          console.warn('[Stitcher] Fast stream copy failed, falling back to re-encode filter...', copyErr.message);
+          console.warn('[Stitcher] Fast copy failed, using re-encode filter...', copyErr.message);
           execSync(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -movflags +faststart "${outFile}"`, { stdio: 'pipe' });
         }
 
-        // Cleanup tmp files
         fs.rmSync(tmpDir, { recursive: true, force: true });
 
         const host = req.headers.host || 'supergrok-api.onrender.com';
         const proto = req.headers['x-forwarded-proto'] || 'https';
         const publicUrl = `${proto}://${host}/v1/media/videos/${assetId}`;
 
-        console.log(`[Stitcher] Success! Output: ${publicUrl}`);
+        console.log(`[Stitcher] Successfully stitched 30s video: ${publicUrl}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           success: true,
@@ -173,7 +161,7 @@ const server = http.createServer((req, res) => {
           url: publicUrl
         }));
       } catch (err) {
-        console.error('[Stitcher] Error stitching videos:', err);
+        console.error('[Stitcher] Error:', err);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: err.message }));
       }
@@ -181,7 +169,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Transparent Reverse Proxy to grok2api (127.0.0.1:5001)
+  // Reverse Proxy to grok2api (127.0.0.1:5001)
   const proxyReq = http.request({
     hostname: '127.0.0.1',
     port: UPSTREAM_PORT,
