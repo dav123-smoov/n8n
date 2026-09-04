@@ -8,7 +8,13 @@ const url = require('url');
 const UPSTREAM_PORT = 5001;
 const LISTEN_PORT = process.env.PORT || 5000;
 const MEDIA_DIR = process.env.MEDIA_DIR || '/app/data/media';
+const FIXED_MASTER_KEY = 'g2a_af54abb0686c_Kfiu6zVhO-mHm26HBIkWgAeVrkirNFhp';
 
+let currentActiveKey = FIXED_MASTER_KEY;
+let isBootstrapped = false;
+let bootstrapPromise = null;
+
+// Start grok2api upstream
 console.log('[Proxy] Starting grok2api upstream on port ' + UPSTREAM_PORT + '...');
 const grokProcess = spawn('/app/grok2api', ['--config', '/app/config.yaml', '--listen', `0.0.0.0:${UPSTREAM_PORT}`], {
   stdio: 'inherit'
@@ -19,52 +25,95 @@ grokProcess.on('exit', (code, sig) => {
   process.exit(code || 1);
 });
 
-// Auto-bootstrap check after grok2api boots
-setTimeout(async () => {
-  try {
-    const sso = process.env.SSO_TOKEN;
-    if (!sso) return;
+async function ensureBootstrapped() {
+  if (isBootstrapped) return currentActiveKey;
+  if (bootstrapPromise) return bootstrapPromise;
 
-    const hRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/healthz`).catch(() => null);
-    if (!hRes || !hRes.ok) return;
-
-    const loginRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'admin', password: 'AdminSuperGrok2026!' })
-    });
-    const loginData = await loginRes.json();
-    const token = loginData.data?.tokens?.accessToken;
-    if (!token) return;
-
-    const accRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/accounts`, {
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
-    const accData = await accRes.json();
-    if (accData.data?.total === 0) {
-      console.log('[Bootstrap] Auto-importing SSO token...');
-      const formData = new FormData();
-      formData.append('file', new Blob([sso], { type: 'text/plain' }), 'sso.txt');
-      await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/accounts/web/import`, {
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + token },
-        body: formData
-      });
-      console.log('[Bootstrap] SSO account imported.');
+  bootstrapPromise = (async () => {
+    console.log('[Bootstrap] Checking upstream and credentials...');
+    // Wait for upstream to be healthy
+    for (let i = 0; i < 30; i++) {
+      try {
+        const hRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/healthz`);
+        if (hRes.ok) break;
+      } catch (e) {}
+      await new Promise(r => setTimeout(r, 1000));
     }
-  } catch (err) {
-    console.error('[Bootstrap] Error:', err.message);
-  }
-}, 5000);
+
+    try {
+      // Login as admin
+      const loginRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'AdminSuperGrok2026!' })
+      });
+      const loginData = await loginRes.json();
+      const adminToken = loginData.data?.tokens?.accessToken;
+      if (!adminToken) throw new Error('Failed to obtain admin token');
+
+      // 1. Check Accounts (Import SSO if 0)
+      const accRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/accounts`, {
+        headers: { 'Authorization': 'Bearer ' + adminToken }
+      });
+      const accData = await accRes.json();
+      const sso = process.env.SSO_TOKEN;
+      if (accData.data?.total === 0 && sso) {
+        console.log('[Bootstrap] Importing SSO token...');
+        const formData = new FormData();
+        formData.append('file', new Blob([sso], { type: 'text/plain' }), 'sso.txt');
+        await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/accounts/web/import`, {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + adminToken },
+          body: formData
+        });
+        console.log('[Bootstrap] SSO account imported.');
+      }
+
+      // 2. Ensure active client key exists
+      const kRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/client-keys`, {
+        headers: { 'Authorization': 'Bearer ' + adminToken }
+      });
+      const kData = await kRes.json();
+      
+      // Always create a fresh known client key on container boot if none or store it
+      if (kData.data?.total === 0) {
+        console.log('[Bootstrap] Generating new client key...');
+        const newKey = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/client-keys`, {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + adminToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'n8n-youtube-autoposter' })
+        });
+        const newKeyData = await newKey.json();
+        if (newKeyData.data?.secret) {
+          currentActiveKey = newKeyData.data.secret;
+          console.log('[Bootstrap] Active client key set to:', currentActiveKey);
+        }
+      } else {
+        console.log('[Bootstrap] Found existing client keys:', kData.data.total);
+      }
+
+      isBootstrapped = true;
+      return currentActiveKey;
+    } catch (err) {
+      console.error('[Bootstrap] Initialization error:', err.message);
+      return currentActiveKey;
+    } finally {
+      bootstrapPromise = null;
+    }
+  })();
+
+  return bootstrapPromise;
+}
+
+// Trigger initial bootstrap in background
+setTimeout(ensureBootstrapped, 2000);
 
 // Helper to download a video URL
 async function downloadToFile(fileUrl, destPath) {
   return new Promise((resolve, reject) => {
-    // If it points to supergrok-api, fetch via localhost loopback
     let target = fileUrl.replace(/https?:\/\/supergrok-api\.onrender\.com/i, `http://127.0.0.1:${UPSTREAM_PORT}`);
     const parsed = new URL(target);
 
-    // Direct local asset check
     if (parsed.pathname.startsWith('/v1/media/videos/')) {
       const assetName = path.basename(parsed.pathname);
       const localCandidate = path.join(MEDIA_DIR, 'videos', assetName);
@@ -99,8 +148,14 @@ async function downloadToFile(fileUrl, destPath) {
 }
 
 // HTTP Server
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
+
+  // Health check endpoint
+  if (parsedUrl.pathname === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, bootstrapped: isBootstrapped }));
+  }
 
   // Custom Endpoint: POST /v1/videos/stitch
   if (req.method === 'POST' && (parsedUrl.pathname === '/v1/videos/stitch' || parsedUrl.pathname === '/api/stitch')) {
@@ -127,12 +182,10 @@ const server = http.createServer((req, res) => {
           downloadedFiles.push(dest);
         }
 
-        // Concat list file
         const listFile = path.join(tmpDir, 'concat_list.txt');
         const listContent = downloadedFiles.map(f => `file '${f}'`).join('\n');
         fs.writeFileSync(listFile, listContent);
 
-        // Output inside grok2api media directory so it's instantly public & servable
         const assetId = 'vid_stitched_' + runId;
         const outDir = path.join(MEDIA_DIR, 'videos');
         fs.mkdirSync(outDir, { recursive: true });
@@ -169,13 +222,32 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Ensure bootstrap is complete before routing API requests
+  if (!isBootstrapped && parsedUrl.pathname.startsWith('/v1/')) {
+    await ensureBootstrapped();
+  }
+
+  // Clone headers for upstream
+  const upstreamHeaders = { ...req.headers };
+
+  // SMART AUTH MAPPING: If incoming request has our master key or any g2a_ key, map to current active key!
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    const incomingToken = authHeader.substring(7).trim();
+    if (incomingToken === FIXED_MASTER_KEY || incomingToken.startsWith('g2a_')) {
+      if (currentActiveKey) {
+        upstreamHeaders['authorization'] = `Bearer ${currentActiveKey}`;
+      }
+    }
+  }
+
   // Reverse Proxy to grok2api (127.0.0.1:5001)
   const proxyReq = http.request({
     hostname: '127.0.0.1',
     port: UPSTREAM_PORT,
     path: req.url,
     method: req.method,
-    headers: req.headers
+    headers: upstreamHeaders
   }, proxyRes => {
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
