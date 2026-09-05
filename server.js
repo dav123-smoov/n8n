@@ -14,6 +14,9 @@ let currentActiveKey = FIXED_MASTER_KEY;
 let isBootstrapped = false;
 let bootstrapPromise = null;
 
+// In-memory registry for 30s composite video jobs
+const jobs30 = {};
+
 // Start grok2api upstream
 console.log('[Proxy] Starting grok2api upstream on port ' + UPSTREAM_PORT + '...');
 const grokProcess = spawn('/app/grok2api', ['--config', '/app/config.yaml', '--listen', `0.0.0.0:${UPSTREAM_PORT}`], {
@@ -31,7 +34,6 @@ async function ensureBootstrapped() {
 
   bootstrapPromise = (async () => {
     console.log('[Bootstrap] Checking upstream and credentials...');
-    // Wait for upstream to be healthy
     for (let i = 0; i < 30; i++) {
       try {
         const hRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/healthz`);
@@ -41,7 +43,6 @@ async function ensureBootstrapped() {
     }
 
     try {
-      // Login as admin
       const loginRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -51,7 +52,6 @@ async function ensureBootstrapped() {
       const adminToken = loginData.data?.tokens?.accessToken;
       if (!adminToken) throw new Error('Failed to obtain admin token');
 
-      // 1. Check Accounts (Import SSO if 0)
       const accRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/accounts`, {
         headers: { 'Authorization': 'Bearer ' + adminToken }
       });
@@ -69,13 +69,10 @@ async function ensureBootstrapped() {
         console.log('[Bootstrap] SSO account imported.');
       }
 
-      // 2. Ensure active client key exists
       const kRes = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/client-keys`, {
         headers: { 'Authorization': 'Bearer ' + adminToken }
       });
       const kData = await kRes.json();
-      
-      // Always create a fresh known client key on container boot if none or store it
       if (kData.data?.total === 0) {
         console.log('[Bootstrap] Generating new client key...');
         const newKey = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/api/admin/v1/client-keys`, {
@@ -88,8 +85,6 @@ async function ensureBootstrapped() {
           currentActiveKey = newKeyData.data.secret;
           console.log('[Bootstrap] Active client key set to:', currentActiveKey);
         }
-      } else {
-        console.log('[Bootstrap] Found existing client keys:', kData.data.total);
       }
 
       isBootstrapped = true;
@@ -105,10 +100,8 @@ async function ensureBootstrapped() {
   return bootstrapPromise;
 }
 
-// Trigger initial bootstrap in background
 setTimeout(ensureBootstrapped, 2000);
 
-// Helper to download a video URL
 async function downloadToFile(fileUrl, destPath) {
   return new Promise((resolve, reject) => {
     let target = fileUrl.replace(/https?:\/\/supergrok-api\.onrender\.com/i, `http://127.0.0.1:${UPSTREAM_PORT}`);
@@ -125,13 +118,7 @@ async function downloadToFile(fileUrl, destPath) {
 
     const isHttps = parsed.protocol === 'https:';
     const getter = isHttps ? https.get : http.get;
-    const reqOptions = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    };
-
-    getter(target, reqOptions, res => {
+    getter(target, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return downloadToFile(res.headers.location, destPath).then(resolve, reject);
       }
@@ -140,24 +127,182 @@ async function downloadToFile(fileUrl, destPath) {
       }
       const file = fs.createWriteStream(destPath);
       res.pipe(file);
-      file.on('finish', () => {
-        file.close(() => resolve(destPath));
-      });
+      file.on('finish', () => file.close(() => resolve(destPath)));
     }).on('error', reject);
   });
+}
+
+// Background handler to generate 2 clips and stitch into 30s
+async function process30sJob(jobId, prompt1, prompt2, aspectRatio, host, proto) {
+  try {
+    console.log(`[30s Orchestrator] Starting 30s generation for ${jobId}...`);
+    jobs30[jobId].progress = 10;
+
+    // Helper to submit a 15s clip to local grok2api
+    async function submitClip(promptText) {
+      const res = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/v1/videos/generations`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${currentActiveKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'grok-imagine-video',
+          prompt: promptText,
+          duration: 15,
+          aspect_ratio: aspectRatio || '9:16'
+        })
+      });
+      const data = await res.json();
+      const reqId = data.request_id || data.id;
+      if (!reqId) throw new Error('Failed to submit clip: ' + JSON.stringify(data));
+      return reqId;
+    }
+
+    // Helper to wait for a clip to complete
+    async function pollClip(reqId) {
+      for (let i = 0; i < 40; i++) {
+        await new Promise(r => setTimeout(r, 4000));
+        const res = await fetch(`http://127.0.0.1:${UPSTREAM_PORT}/v1/videos/${reqId}`, {
+          headers: { 'Authorization': `Bearer ${currentActiveKey}` }
+        });
+        const data = await res.json();
+        if (data.status === 'done' || data.status === 'completed') {
+          return data.asset_url || `${proto}://${host}/v1/media/videos/${data.asset_id || data.video_id}`;
+        }
+        if (data.status === 'failed' || data.status === 'error') {
+          throw new Error('Clip rendering failed: ' + (data.error_message || data.errorMessage));
+        }
+      }
+      throw new Error('Clip rendering timed out');
+    }
+
+    console.log(`[30s Orchestrator] Submitting Clip 1 and Clip 2 in parallel...`);
+    const id1 = await submitClip(prompt1);
+    // Slight pause to ensure distinct task IDs
+    await new Promise(r => setTimeout(r, 1000));
+    const id2 = await submitClip(prompt2);
+
+    jobs30[jobId].progress = 25;
+    console.log(`[30s Orchestrator] Polling clips ${id1} and ${id2}...`);
+
+    // Poll both clips concurrently
+    const [clip1Url, clip2Url] = await Promise.all([pollClip(id1), pollClip(id2)]);
+    console.log(`[30s Orchestrator] Both clips ready! Clip1: ${clip1Url}, Clip2: ${clip2Url}`);
+    jobs30[jobId].progress = 85;
+
+    // Stitch via local FFmpeg
+    const tmpDir = path.join('/tmp', 'stitch_' + jobId);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const f1 = path.join(tmpDir, 'clip_0.mp4');
+    const f2 = path.join(tmpDir, 'clip_1.mp4');
+    await downloadToFile(clip1Url, f1);
+    await downloadToFile(clip2Url, f2);
+
+    const listFile = path.join(tmpDir, 'list.txt');
+    fs.writeFileSync(listFile, `file '${f1}'\nfile '${f2}'`);
+
+    const assetId = 'vid_stitched_' + jobId;
+    const outDir = path.join(MEDIA_DIR, 'videos');
+    fs.mkdirSync(outDir, { recursive: true });
+    const outFile = path.join(outDir, assetId);
+
+    console.log(`[30s Orchestrator] Concatenating 30s Short to ${outFile}...`);
+    try {
+      execSync(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy -movflags +faststart "${outFile}"`, { stdio: 'pipe' });
+    } catch (e) {
+      execSync(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -movflags +faststart "${outFile}"`, { stdio: 'pipe' });
+    }
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    const finalUrl = `${proto}://${host}/v1/media/videos/${assetId}`;
+
+    jobs30[jobId] = {
+      status: 'completed',
+      progress: 100,
+      duration: 30,
+      asset_id: assetId,
+      video_id: assetId,
+      url: finalUrl,
+      asset_url: finalUrl
+    };
+    console.log(`[30s Orchestrator] Job ${jobId} finished successfully! 30s Video: ${finalUrl}`);
+  } catch (err) {
+    console.error(`[30s Orchestrator] Error on job ${jobId}:`, err);
+    jobs30[jobId] = {
+      status: 'failed',
+      progress: 0,
+      error_message: err.message
+    };
+  }
 }
 
 // HTTP Server
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
+  const host = req.headers.host || 'supergrok-api.onrender.com';
+  const proto = req.headers['x-forwarded-proto'] || 'https';
 
-  // Health check endpoint
   if (parsedUrl.pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, bootstrapped: isBootstrapped }));
   }
 
-  // Custom Endpoint: POST /v1/videos/stitch
+  // Intercept GET /v1/videos/:requestId for 30s composite jobs
+  if (req.method === 'GET' && parsedUrl.pathname.startsWith('/v1/videos/video_30s_')) {
+    const jobId = path.basename(parsedUrl.pathname);
+    const job = jobs30[jobId];
+    if (job) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(job));
+    }
+  }
+
+  // Intercept POST /v1/videos/generations when duration == 30 or prompt_clip1/2 provided
+  if (req.method === 'POST' && parsedUrl.pathname === '/v1/videos/generations') {
+    let bodyText = '';
+    req.on('data', chunk => bodyText += chunk);
+    req.on('end', async () => {
+      try {
+        const payload = JSON.parse(bodyText);
+        const duration = Number(payload.duration) || 15;
+        const hasTwoPrompts = Boolean(payload.prompt_clip1 && payload.prompt_clip2);
+
+        if (duration === 30 || hasTwoPrompts) {
+          await ensureBootstrapped();
+          const jobId = 'video_30s_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+          
+          let p1 = payload.prompt_clip1 || payload.prompt;
+          let p2 = payload.prompt_clip2 || (payload.prompt + ' (Part 2: Continuing camera move directly into climax)');
+
+          jobs30[jobId] = {
+            id: jobId,
+            request_id: jobId,
+            status: 'processing',
+            progress: 5
+          };
+
+          // Trigger 30s pipeline in background
+          process30sJob(jobId, p1, p2, payload.aspect_ratio, host, proto);
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            id: jobId,
+            request_id: jobId,
+            status: 'processing'
+          }));
+        }
+
+        // Standard 15s generation pass-through
+        proxyPass(req, res, bodyText);
+      } catch (err) {
+        proxyPass(req, res, bodyText);
+      }
+    });
+    return;
+  }
+
+  // Manual stitch endpoint
   if (req.method === 'POST' && (parsedUrl.pathname === '/v1/videos/stitch' || parsedUrl.pathname === '/api/stitch')) {
     let body = '';
     req.on('data', chunk => body += chunk);
@@ -167,14 +312,13 @@ const server = http.createServer(async (req, res) => {
         const videos = payload.videos || payload.urls;
         if (!Array.isArray(videos) || videos.length < 2) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({ error: 'Expected at least 2 video URLs in "videos" array' }));
+          return res.end(JSON.stringify({ error: 'Expected at least 2 video URLs' }));
         }
 
         const runId = Date.now() + '_' + Math.random().toString(36).substring(2, 7);
         const tmpDir = path.join('/tmp', 'stitch_' + runId);
         fs.mkdirSync(tmpDir, { recursive: true });
 
-        console.log(`[Stitcher] Downloading ${videos.length} videos...`);
         const downloadedFiles = [];
         for (let i = 0; i < videos.length; i++) {
           const dest = path.join(tmpDir, `clip_${i}.mp4`);
@@ -183,29 +327,22 @@ const server = http.createServer(async (req, res) => {
         }
 
         const listFile = path.join(tmpDir, 'concat_list.txt');
-        const listContent = downloadedFiles.map(f => `file '${f}'`).join('\n');
-        fs.writeFileSync(listFile, listContent);
+        fs.writeFileSync(listFile, downloadedFiles.map(f => `file '${f}'`).join('\n'));
 
         const assetId = 'vid_stitched_' + runId;
         const outDir = path.join(MEDIA_DIR, 'videos');
         fs.mkdirSync(outDir, { recursive: true });
         const outFile = path.join(outDir, assetId);
 
-        console.log(`[Stitcher] Running FFmpeg concat to ${outFile}...`);
         try {
           execSync(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy -movflags +faststart "${outFile}"`, { stdio: 'pipe' });
-        } catch (copyErr) {
-          console.warn('[Stitcher] Fast copy failed, using re-encode filter...', copyErr.message);
+        } catch (e) {
           execSync(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -movflags +faststart "${outFile}"`, { stdio: 'pipe' });
         }
 
         fs.rmSync(tmpDir, { recursive: true, force: true });
-
-        const host = req.headers.host || 'supergrok-api.onrender.com';
-        const proto = req.headers['x-forwarded-proto'] || 'https';
         const publicUrl = `${proto}://${host}/v1/media/videos/${assetId}`;
 
-        console.log(`[Stitcher] Successfully stitched 30s video: ${publicUrl}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
           success: true,
@@ -214,7 +351,6 @@ const server = http.createServer(async (req, res) => {
           url: publicUrl
         }));
       } catch (err) {
-        console.error('[Stitcher] Error:', err);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: err.message }));
       }
@@ -222,15 +358,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Ensure bootstrap is complete before routing API requests
-  if (!isBootstrapped && parsedUrl.pathname.startsWith('/v1/')) {
-    await ensureBootstrapped();
+  // Standard Reverse Proxy Pass-through
+  proxyPass(req, res);
+});
+
+function proxyPass(req, res, customBody) {
+  if (!isBootstrapped && req.url.startsWith('/v1/')) {
+    ensureBootstrapped().then(() => doProxy(req, res, customBody));
+  } else {
+    doProxy(req, res, customBody);
   }
+}
 
-  // Clone headers for upstream
+function doProxy(req, res, customBody) {
   const upstreamHeaders = { ...req.headers };
-
-  // SMART AUTH MAPPING: If incoming request has our master key or any g2a_ key, map to current active key!
   const authHeader = req.headers['authorization'] || '';
   if (authHeader.toLowerCase().startsWith('bearer ')) {
     const incomingToken = authHeader.substring(7).trim();
@@ -241,7 +382,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Reverse Proxy to grok2api (127.0.0.1:5001)
   const proxyReq = http.request({
     hostname: '127.0.0.1',
     port: UPSTREAM_PORT,
@@ -259,8 +399,13 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: 'grok2api upstream unreachable' }));
   });
 
-  req.pipe(proxyReq);
-});
+  if (customBody) {
+    proxyReq.write(customBody);
+    proxyReq.end();
+  } else {
+    req.pipe(proxyReq);
+  }
+}
 
 server.listen(LISTEN_PORT, '0.0.0.0', () => {
   console.log(`[Proxy] Server listening on port ${LISTEN_PORT}, forwarding to 127.0.0.1:${UPSTREAM_PORT}`);
